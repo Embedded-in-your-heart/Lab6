@@ -22,8 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include <string.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,21 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 0 = Part(1) HAL + IT (interrupt per conversion)
- * 1 = Part(2) HAL + DMA circular (HT/TC interrupts on half/full buffer) */
-#define ADC_MODE_DMA          1
 
-#define SAMPLE_BUFFER_SIZE    16U
-#define HALF_BUFFER_SIZE      (SAMPLE_BUFFER_SIZE / 2U)
-
-/* STM32L475 temperature sensor factory calibration (VREF = 3.0 V)
- * RM0351 / DS10969 */
-#define TS_CAL1_ADDR          ((uint16_t*)0x1FFF75A8U)   /* @ 30 C  */
-#define TS_CAL2_ADDR          ((uint16_t*)0x1FFF75CAU)   /* @ 130 C */
-#define TS_CAL1_TEMP          30.0f
-#define TS_CAL2_TEMP          130.0f
-#define VREF_CAL              3.0f
-#define VREF_BOARD            3.3f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,10 +43,6 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
-
-DFSDM_Channel_HandleTypeDef hdfsdm1_channel2;
-DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
-DMA_HandleTypeDef hdma_dfsdm1_flt0;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
@@ -82,15 +63,7 @@ const osSemaphoreAttr_t micSem_attributes = {
   .name = "micSem"
 };
 /* USER CODE BEGIN PV */
-static uint16_t sample_buffer[SAMPLE_BUFFER_SIZE];
 
-#define PCM_BUFFER_SIZE    512
-static int32_t pcm_buffer[PCM_BUFFER_SIZE];
-
-/* Flags set in ISR, consumed by RTOS task.
- * Bit0 = upper half ready, Bit1 = lower half ready, Bit2 = single conv ready */
-static volatile uint8_t  adc_event_flag = 0;
-static volatile uint16_t adc_single_value = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,7 +71,6 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_DFSDM1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
@@ -106,9 +78,7 @@ static void MX_TIM6_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-static float    adc_to_celsius(uint16_t raw);
-static void     uart_print(const char *s);
-static void     print_samples(const uint16_t *buf, uint16_t n);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -147,34 +117,12 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_DFSDM1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
   MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
-  /* Self-calibrate the ADC before any conversion (required on STM32L4).
-   * ADC/TIM are started later, inside the RTOS task, after the kernel and
-   * semaphore are alive — otherwise the first ISR would touch a NULL handle. */
-  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
-  {
-    Error_Handler();
-  }
 
-  /* Override CubeMX default (DATA_PRESERVED). With PRESERVED, the ADC freezes
-   * the moment an overrun occurs and never recovers, so DMA stops getting
-   * requests. OVRMOD=1 lets new conversions overwrite, keeping the pipeline
-   * alive even if the task momentarily lags behind UART. */
-  SET_BIT(hadc1.Instance->CFGR, ADC_CFGR_OVRMOD);
-
-  /* Start DMA for DFSDM1 Filter 0 (continuous, circular buffer) */
-  /* DFSDM1_FLT0_RDATAR = DFSDM1_BASE + 0x100 + 0xD0 = 0x40004000 + 0x1D0 */
-  if (HAL_DMA_Start_IT(&hdma_dfsdm1_flt0,
-                       0x400041D0,  /* DFSDM1_FLT0 Data Register address */
-                       (uint32_t)pcm_buffer,
-                       PCM_BUFFER_SIZE) != HAL_OK) {
-    Error_Handler();
-  }
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -533,6 +481,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  NVIC_SetPriority(DMA1_Channel4_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
+  NVIC_EnableIRQ(DMA1_Channel4_IRQn);
 
 }
 
@@ -758,103 +709,8 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
-static void MX_DFSDM1_Init(void)
-{
-  /* DFSDM clock enable + basic init deferred to HAL MSP callbacks */
-  __HAL_RCC_DFSDM1_CLK_ENABLE();
-}
-
 /* USER CODE BEGIN 4 */
-static float adc_to_celsius(uint16_t raw)
-{
-  /* Compensate VREF (board uses 3.3 V, factory cal at 3.0 V) */
-  int32_t adj = (int32_t)((float)raw * (VREF_BOARD / VREF_CAL));
-  int32_t cal1 = *TS_CAL1_ADDR;
-  int32_t cal2 = *TS_CAL2_ADDR;
-  return ((TS_CAL2_TEMP - TS_CAL1_TEMP) * (float)(adj - cal1)) /
-         (float)(cal2 - cal1) + TS_CAL1_TEMP;
-}
 
-static void uart_print(const char *s)
-{
-  HAL_UART_Transmit(&huart1, (const uint8_t*)s, strlen(s), HAL_MAX_DELAY);
-}
-
-/* nano.specs printf has no float support, so print temperature as int*100. */
-static void print_samples(const uint16_t *buf, uint16_t n)
-{
-  char line[48];
-  for (uint16_t i = 0; i < n; ++i)
-  {
-    int32_t t100 = (int32_t)(adc_to_celsius(buf[i]) * 100.0f);
-    int len = snprintf(line, sizeof(line),
-                       "raw=%4u  T=%ld.%02lu C\r\n",
-                       buf[i],
-                       (long)(t100 / 100),
-                       (unsigned long)((t100 < 0 ? -t100 : t100) % 100));
-    if (len > 0)
-    {
-      HAL_UART_Transmit(&huart1, (uint8_t*)line, (uint16_t)len, HAL_MAX_DELAY);
-    }
-  }
-}
-
-/* === ADC ISR callbacks ============================================== */
-/* Part(1): single conversion complete (IT mode) and
- * Part(2): full buffer transferred (DMA TC, lower half ready). */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance != ADC1) return;
-
-#if ADC_MODE_DMA
-  adc_event_flag |= 0x02U;          /* lower half ready */
-#else
-  adc_single_value = (uint16_t)HAL_ADC_GetValue(hadc);
-  adc_event_flag  |= 0x04U;         /* single conversion ready */
-#endif
-
-  /* Wake up the printing task (FromISR variant) */
-  osSemaphoreRelease(micSemHandle);
-}
-
-/* Part(2) only: half buffer transferred (DMA HT, upper half ready). */
-void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance != ADC1) return;
-
-  adc_event_flag |= 0x01U;          /* upper half ready */
-  osSemaphoreRelease(micSemHandle);
-}
-
-/* Never block UART inside an ISR. Just record the latest error code and
- * let the task surface it on the next iteration. */
-static volatile uint32_t adc_last_error = 0;
-
-void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance != ADC1) return;
-  adc_last_error = HAL_ADC_GetError(hadc);
-  __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_OVR);
-  adc_event_flag |= 0x08U;          /* error pending */
-  osSemaphoreRelease(micSemHandle);
-}
-
-/* DFSDM DMA callbacks: toggle GPIO pins for logic analyzer */
-void HAL_DMA_TransferHalfCpltCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma->Instance == DMA1_Channel4) {
-    /* PCM_Buffer top half filled — toggle LOGIC_PIN1 (PA15) */
-    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_15);
-  }
-}
-
-void HAL_DMA_TransferCpltCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma->Instance == DMA1_Channel4) {
-    /* PCM_Buffer bottom half filled — toggle LOGIC_PIN2 (PB2) */
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_2);
-  }
-}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -867,71 +723,10 @@ void HAL_DMA_TransferCpltCallback(DMA_HandleTypeDef *hdma)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  uart_print("\r\n=== Lab6 ADC + TIM1 trigger demo ===\r\n");
-#if ADC_MODE_DMA
-  uart_print("Mode: HAL + DMA circular (HT/TC)\r\n");
-  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)sample_buffer, SAMPLE_BUFFER_SIZE) != HAL_OK)
+  /* Infinite loop */
+  for(;;)
   {
-    Error_Handler();
-  }
-#else
-  uart_print("Mode: HAL + IT (interrupt per conversion)\r\n");
-  if (HAL_ADC_Start_IT(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-#endif
-  /* TIM1 TRGO drives the ADC every (PSC+1)*(ARR+1)/fclk = 80 * 10000 / 80MHz
-   * = 10 ms  ->  sampling frequency 100 Hz. */
-  if (HAL_TIM_Base_Start(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  for (;;)
-  {
-    /* Block until an ISR releases the semaphore */
-    if (osSemaphoreAcquire(micSemHandle, osWaitForever) != osOK)
-    {
-      continue;
-    }
-
-    /* Snapshot & clear flags atomically */
-    uint8_t flags;
-    taskENTER_CRITICAL();
-    flags = adc_event_flag;
-    adc_event_flag = 0;
-    taskEXIT_CRITICAL();
-
-    if (flags & 0x08U)
-    {
-      char buf[48];
-      int n = snprintf(buf, sizeof(buf), "[ADC ERR 0x%08lX]\r\n",
-                       (unsigned long)adc_last_error);
-      if (n > 0)
-      {
-        HAL_UART_Transmit(&huart1, (uint8_t*)buf, (uint16_t)n, HAL_MAX_DELAY);
-      }
-    }
-
-#if ADC_MODE_DMA
-    if (flags & 0x01U)              /* upper half */
-    {
-      uart_print("-- upper half --\r\n");
-      print_samples(&sample_buffer[0], HALF_BUFFER_SIZE);
-    }
-    if (flags & 0x02U)              /* lower half */
-    {
-      uart_print("-- lower half --\r\n");
-      print_samples(&sample_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
-    }
-#else
-    if (flags & 0x04U)
-    {
-      uint16_t raw = adc_single_value;
-      print_samples(&raw, 1);
-    }
-#endif
+    osDelay(1);
   }
   /* USER CODE END 5 */
 }

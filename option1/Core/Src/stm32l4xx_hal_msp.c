@@ -23,8 +23,6 @@
 
 /* USER CODE END Includes */
 extern DMA_HandleTypeDef hdma_adc1;
-extern DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
-extern DMA_HandleTypeDef hdma_dfsdm1_flt0;
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
@@ -270,7 +268,7 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
     /* Peripheral clock enable */
     __HAL_RCC_TIM6_CLK_ENABLE();
     /* TIM6 interrupt Init */
-    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 15, 0);
+    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
     /* USER CODE BEGIN TIM6_MspInit 1 */
 
@@ -412,47 +410,6 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     /* USER CODE END USART1_MspDeInit 1 */
   }
 
-}
-
-void HAL_DFSDM_ChannelMspInit(DFSDM_Channel_HandleTypeDef* hdfsdm_channel)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_DMA1_CLK_ENABLE();
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-
-  /* Configure DFSDM1 GPIO pins (PE7 = DATIN2, PE9 = CKOUT) */
-  GPIO_InitStruct.Pin = GPIO_PIN_7 | GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF6_DFSDM1;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-}
-
-void HAL_DFSDM_FilterMspInit(DFSDM_Filter_HandleTypeDef* hdfsdm_filter)
-{
-  /* Configure DMA for DFSDM1_FLT0 */
-  hdma_dfsdm1_flt0.Instance = DMA1_Channel4;
-  hdma_dfsdm1_flt0.Init.Request = DMA_REQUEST_0;
-  hdma_dfsdm1_flt0.Init.Direction = DMA_PERIPH_TO_MEMORY;
-  hdma_dfsdm1_flt0.Init.PeriphInc = DMA_PINC_DISABLE;
-  hdma_dfsdm1_flt0.Init.MemInc = DMA_MINC_ENABLE;
-  hdma_dfsdm1_flt0.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
-  hdma_dfsdm1_flt0.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
-  hdma_dfsdm1_flt0.Init.Mode = DMA_CIRCULAR;
-  hdma_dfsdm1_flt0.Init.Priority = DMA_PRIORITY_HIGH;
-
-  if (HAL_DMA_Init(&hdma_dfsdm1_flt0) != HAL_OK) {
-    Error_Handler();
-  }
-
-  /* DMA interrupt priority */
-  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
-
-  /* DFSDM filter interrupt */
-  HAL_NVIC_SetPriority(DFSDM1_FLT0_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(DFSDM1_FLT0_IRQn);
 }
 
 /* USER CODE BEGIN 1 */
