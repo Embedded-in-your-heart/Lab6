@@ -23,7 +23,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
-#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,21 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 0 = Part(1) HAL + IT (interrupt per conversion)
- * 1 = Part(2) HAL + DMA circular (HT/TC interrupts on half/full buffer) */
-#define ADC_MODE_DMA          1
 
-#define SAMPLE_BUFFER_SIZE    16U
-#define HALF_BUFFER_SIZE      (SAMPLE_BUFFER_SIZE / 2U)
-
-/* STM32L475 temperature sensor factory calibration (VREF = 3.0 V)
- * RM0351 / DS10969 */
-#define TS_CAL1_ADDR          ((uint16_t*)0x1FFF75A8U)   /* @ 30 C  */
-#define TS_CAL2_ADDR          ((uint16_t*)0x1FFF75CAU)   /* @ 130 C */
-#define TS_CAL1_TEMP          30.0f
-#define TS_CAL2_TEMP          130.0f
-#define VREF_CAL              3.0f
-#define VREF_BOARD            3.3f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,8 +44,8 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
-DFSDM_Channel_HandleTypeDef hdfsdm1_channel2;
 DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
+DFSDM_Channel_HandleTypeDef hdfsdm1_channel2;
 DMA_HandleTypeDef hdma_dfsdm1_flt0;
 
 TIM_HandleTypeDef htim1;
@@ -76,39 +61,40 @@ const osThreadAttr_t defaultTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for micSem */
-osSemaphoreId_t micSemHandle;
-const osSemaphoreAttr_t micSem_attributes = {
-  .name = "micSem"
+/* Definitions for adcSem */
+osSemaphoreId_t adcSemHandle;
+const osSemaphoreAttr_t adcSem_attributes = {
+  .name = "adcSem"
 };
 /* USER CODE BEGIN PV */
-static uint16_t sample_buffer[SAMPLE_BUFFER_SIZE];
+#define AUDIO_REC 1024
+int32_t RecBuf[AUDIO_REC];
+int32_t PlayBuf[AUDIO_REC];
 
-#define PCM_BUFFER_SIZE    512
-static int32_t pcm_buffer[PCM_BUFFER_SIZE];
+volatile uint8_t DmaRecHalBuffCplt=0;
+volatile uint8_t DmaRecBuffCplt=0;
+int __io_putchar(int ch) { 
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);  
+  return ch;
+}
 
-/* Flags set in ISR, consumed by RTOS task.
- * Bit0 = upper half ready, Bit1 = lower half ready, Bit2 = single conv ready */
-static volatile uint8_t  adc_event_flag = 0;
-static volatile uint16_t adc_single_value = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_DFSDM1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_DFSDM1_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-static float    adc_to_celsius(uint16_t raw);
-static void     uart_print(const char *s);
-static void     print_samples(const uint16_t *buf, uint16_t n);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -139,6 +125,9 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
+  /* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -147,34 +136,13 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_DFSDM1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
   MX_TIM6_Init();
+  MX_DFSDM1_Init();
   /* USER CODE BEGIN 2 */
-  /* Self-calibrate the ADC before any conversion (required on STM32L4).
-   * ADC/TIM are started later, inside the RTOS task, after the kernel and
-   * semaphore are alive — otherwise the first ISR would touch a NULL handle. */
-  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /* Override CubeMX default (DATA_PRESERVED). With PRESERVED, the ADC freezes
-   * the moment an overrun occurs and never recovers, so DMA stops getting
-   * requests. OVRMOD=1 lets new conversions overwrite, keeping the pipeline
-   * alive even if the task momentarily lags behind UART. */
-  SET_BIT(hadc1.Instance->CFGR, ADC_CFGR_OVRMOD);
-
-  /* Start DMA for DFSDM1 Filter 0 (continuous, circular buffer) */
-  /* DFSDM1_FLT0_RDATAR = DFSDM1_BASE + 0x100 + 0xD0 = 0x40004000 + 0x1D0 */
-  if (HAL_DMA_Start_IT(&hdma_dfsdm1_flt0,
-                       0x400041D0,  /* DFSDM1_FLT0 Data Register address */
-                       (uint32_t)pcm_buffer,
-                       PCM_BUFFER_SIZE) != HAL_OK) {
-    Error_Handler();
-  }
+  HAL_DFSDM_FilterRegularStart_DMA(&hdfsdm1_filter0, RecBuf, AUDIO_REC);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -185,8 +153,8 @@ int main(void)
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
-  /* creation of micSem */
-  micSemHandle = osSemaphoreNew(1, 0, &micSem_attributes);
+  /* creation of adcSem */
+  adcSemHandle = osSemaphoreNew(1, 0, &adcSem_attributes);
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
@@ -289,6 +257,32 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the peripherals clock
+  */
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_SAI1|RCC_PERIPHCLK_ADC;
+  PeriphClkInit.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLLSAI1;
+  PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
+  PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_MSI;
+  PeriphClkInit.PLLSAI1.PLLSAI1M = 1;
+  PeriphClkInit.PLLSAI1.PLLSAI1N = 24;
+  PeriphClkInit.PLLSAI1.PLLSAI1P = RCC_PLLP_DIV7;
+  PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_SAI1CLK|RCC_PLLSAI1_ADC1CLK;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief ADC1 Initialization Function
   * @param None
   * @retval None
@@ -352,6 +346,68 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief DFSDM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DFSDM1_Init(void)
+{
+
+  /* USER CODE BEGIN DFSDM1_Init 0 */
+
+  /* USER CODE END DFSDM1_Init 0 */
+
+  /* USER CODE BEGIN DFSDM1_Init 1 */
+
+  /* USER CODE END DFSDM1_Init 1 */
+  hdfsdm1_filter0.Instance = DFSDM1_Filter0;
+  hdfsdm1_filter0.Init.RegularParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
+  hdfsdm1_filter0.Init.RegularParam.FastMode = DISABLE;
+  hdfsdm1_filter0.Init.RegularParam.DmaMode = ENABLE;
+  hdfsdm1_filter0.Init.InjectedParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
+  hdfsdm1_filter0.Init.InjectedParam.ScanMode = DISABLE;
+  hdfsdm1_filter0.Init.InjectedParam.DmaMode = DISABLE;
+  hdfsdm1_filter0.Init.InjectedParam.ExtTrigger = DFSDM_FILTER_EXT_TRIG_TIM1_TRGO;
+  hdfsdm1_filter0.Init.InjectedParam.ExtTriggerEdge = DFSDM_FILTER_EXT_TRIG_RISING_EDGE;
+  hdfsdm1_filter0.Init.FilterParam.SincOrder = DFSDM_FILTER_SINC3_ORDER;
+  hdfsdm1_filter0.Init.FilterParam.Oversampling = 250;
+  hdfsdm1_filter0.Init.FilterParam.IntOversampling = 1;
+  if (HAL_DFSDM_FilterInit(&hdfsdm1_filter0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  hdfsdm1_channel2.Instance = DFSDM1_Channel2;
+  hdfsdm1_channel2.Init.OutputClock.Activation = ENABLE;
+  hdfsdm1_channel2.Init.OutputClock.Selection = DFSDM_CHANNEL_OUTPUT_CLOCK_AUDIO;
+  hdfsdm1_channel2.Init.OutputClock.Divider = 40;
+  hdfsdm1_channel2.Init.Input.Multiplexer = DFSDM_CHANNEL_EXTERNAL_INPUTS;
+  hdfsdm1_channel2.Init.Input.DataPacking = DFSDM_CHANNEL_STANDARD_MODE;
+  hdfsdm1_channel2.Init.Input.Pins = DFSDM_CHANNEL_SAME_CHANNEL_PINS;
+  hdfsdm1_channel2.Init.SerialInterface.Type = DFSDM_CHANNEL_SPI_RISING;
+  hdfsdm1_channel2.Init.SerialInterface.SpiClock = DFSDM_CHANNEL_SPI_CLOCK_INTERNAL;
+  hdfsdm1_channel2.Init.Awd.FilterOrder = DFSDM_CHANNEL_FASTSINC_ORDER;
+  hdfsdm1_channel2.Init.Awd.Oversampling = 1;
+  hdfsdm1_channel2.Init.Offset = 0;
+  hdfsdm1_channel2.Init.RightBitShift = 0x00;
+  if (HAL_DFSDM_ChannelInit(&hdfsdm1_channel2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DFSDM_FilterConfigRegChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_2, DFSDM_CONTINUOUS_CONV_ON) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DFSDM_FilterConfigInjChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DFSDM1_Init 2 */
+
+  /* USER CODE END DFSDM1_Init 2 */
 
 }
 
@@ -533,6 +589,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
 
 }
 
@@ -637,14 +696,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : DFSDM1_DATIN2_Pin DFSDM1_CKOUT_Pin */
-  GPIO_InitStruct.Pin = DFSDM1_DATIN2_Pin|DFSDM1_CKOUT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF6_DFSDM1;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pins : QUADSPI_CLK_Pin QUADSPI_NCS_Pin OQUADSPI_BK1_IO0_Pin QUADSPI_BK1_IO1_Pin
                            QUAD_SPI_BK1_IO2_Pin QUAD_SPI_BK1_IO3_Pin */
@@ -758,102 +809,24 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
-static void MX_DFSDM1_Init(void)
-{
-  /* DFSDM clock enable + basic init deferred to HAL MSP callbacks */
-  __HAL_RCC_DFSDM1_CLK_ENABLE();
-}
-
 /* USER CODE BEGIN 4 */
-static float adc_to_celsius(uint16_t raw)
+void HAL_DFSDM_FilterRegConvHalfCpltCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
 {
-  /* Compensate VREF (board uses 3.3 V, factory cal at 3.0 V) */
-  int32_t adj = (int32_t)((float)raw * (VREF_BOARD / VREF_CAL));
-  int32_t cal1 = *TS_CAL1_ADDR;
-  int32_t cal2 = *TS_CAL2_ADDR;
-  return ((TS_CAL2_TEMP - TS_CAL1_TEMP) * (float)(adj - cal1)) /
-         (float)(cal2 - cal1) + TS_CAL1_TEMP;
+  printf("RegConvHalfCpltCallback\r\n");
+  DmaRecHalBuffCplt=1;
 }
 
-static void uart_print(const char *s)
+void HAL_DFSDM_FilterRegConvCpltCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
 {
-  HAL_UART_Transmit(&huart1, (const uint8_t*)s, strlen(s), HAL_MAX_DELAY);
+  printf("RegConvCpltCallback\r\n");
+  DmaRecHalBuffCplt=1;
 }
 
-/* nano.specs printf has no float support, so print temperature as int*100. */
-static void print_samples(const uint16_t *buf, uint16_t n)
+void HAL_DFSDM_FilterErrorCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
 {
-  char line[48];
-  for (uint16_t i = 0; i < n; ++i)
-  {
-    int32_t t100 = (int32_t)(adc_to_celsius(buf[i]) * 100.0f);
-    int len = snprintf(line, sizeof(line),
-                       "raw=%4u  T=%ld.%02lu C\r\n",
-                       buf[i],
-                       (long)(t100 / 100),
-                       (unsigned long)((t100 < 0 ? -t100 : t100) % 100));
-    if (len > 0)
-    {
-      HAL_UART_Transmit(&huart1, (uint8_t*)line, (uint16_t)len, HAL_MAX_DELAY);
-    }
-  }
-}
-
-/* === ADC ISR callbacks ============================================== */
-/* Part(1): single conversion complete (IT mode) and
- * Part(2): full buffer transferred (DMA TC, lower half ready). */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance != ADC1) return;
-
-#if ADC_MODE_DMA
-  adc_event_flag |= 0x02U;          /* lower half ready */
-#else
-  adc_single_value = (uint16_t)HAL_ADC_GetValue(hadc);
-  adc_event_flag  |= 0x04U;         /* single conversion ready */
-#endif
-
-  /* Wake up the printing task (FromISR variant) */
-  osSemaphoreRelease(micSemHandle);
-}
-
-/* Part(2) only: half buffer transferred (DMA HT, upper half ready). */
-void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance != ADC1) return;
-
-  adc_event_flag |= 0x01U;          /* upper half ready */
-  osSemaphoreRelease(micSemHandle);
-}
-
-/* Never block UART inside an ISR. Just record the latest error code and
- * let the task surface it on the next iteration. */
-static volatile uint32_t adc_last_error = 0;
-
-void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance != ADC1) return;
-  adc_last_error = HAL_ADC_GetError(hadc);
-  __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_OVR);
-  adc_event_flag |= 0x08U;          /* error pending */
-  osSemaphoreRelease(micSemHandle);
-}
-
-/* DFSDM DMA callbacks: toggle GPIO pins for logic analyzer */
-void HAL_DMA_TransferHalfCpltCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma->Instance == DMA1_Channel4) {
-    /* PCM_Buffer top half filled — toggle LOGIC_PIN1 (PA15) */
-    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_15);
-  }
-}
-
-void HAL_DMA_TransferCpltCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma->Instance == DMA1_Channel4) {
-    /* PCM_Buffer bottom half filled — toggle LOGIC_PIN2 (PB2) */
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_2);
-  }
+    // 在這裡打個斷點 (Breakpoint)
+    // 檢查 hdfsdm_filter->ErrorCode
+    printf("DFSDM Error!\r\n"); 
 }
 /* USER CODE END 4 */
 
@@ -867,71 +840,32 @@ void HAL_DMA_TransferCpltCallback(DMA_HandleTypeDef *hdma)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  uart_print("\r\n=== Lab6 ADC + TIM1 trigger demo ===\r\n");
-#if ADC_MODE_DMA
-  uart_print("Mode: HAL + DMA circular (HT/TC)\r\n");
-  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)sample_buffer, SAMPLE_BUFFER_SIZE) != HAL_OK)
+  /* Infinite loop */
+  for(;;)
   {
-    Error_Handler();
-  }
-#else
-  uart_print("Mode: HAL + IT (interrupt per conversion)\r\n");
-  if (HAL_ADC_Start_IT(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-#endif
-  /* TIM1 TRGO drives the ADC every (PSC+1)*(ARR+1)/fclk = 80 * 10000 / 80MHz
-   * = 10 ms  ->  sampling frequency 100 Hz. */
-  if (HAL_TIM_Base_Start(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  for (;;)
-  {
-    /* Block until an ISR releases the semaphore */
-    if (osSemaphoreAcquire(micSemHandle, osWaitForever) != osOK)
+    printf("Default Task\r\n");
+    if (DmaRecHalBuffCplt)
     {
-      continue;
-    }
-
-    /* Snapshot & clear flags atomically */
-    uint8_t flags;
-    taskENTER_CRITICAL();
-    flags = adc_event_flag;
-    adc_event_flag = 0;
-    taskEXIT_CRITICAL();
-
-    if (flags & 0x08U)
-    {
-      char buf[48];
-      int n = snprintf(buf, sizeof(buf), "[ADC ERR 0x%08lX]\r\n",
-                       (unsigned long)adc_last_error);
-      if (n > 0)
-      {
-        HAL_UART_Transmit(&huart1, (uint8_t*)buf, (uint16_t)n, HAL_MAX_DELAY);
+      printf("Hal PlayBuf: ");
+      for(int i=0;i<AUDIO_REC;i++) {
+        PlayBuf[i]=RecBuf[i]>>8;
+        printf("%ld ",PlayBuf[i]);
       }
+      printf("\r\n");
+      //HAL_DFSDM_FilterRegularStart_DMA(&hdfsdm1_filter0, RecBuf, AUDIO_REC);
+      DmaRecHalBuffCplt=0;
     }
-
-#if ADC_MODE_DMA
-    if (flags & 0x01U)              /* upper half */
+    if (DmaRecBuffCplt)
     {
-      uart_print("-- upper half --\r\n");
-      print_samples(&sample_buffer[0], HALF_BUFFER_SIZE);
+      printf("PlayBuf: ");
+      for(int i=0;i<AUDIO_REC;i++) {
+        PlayBuf[i]=RecBuf[i]>>8;
+        printf("%ld ",PlayBuf[i]);
+      }
+      printf("\r\n");
+      DmaRecBuffCplt=0;
     }
-    if (flags & 0x02U)              /* lower half */
-    {
-      uart_print("-- lower half --\r\n");
-      print_samples(&sample_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
-    }
-#else
-    if (flags & 0x04U)
-    {
-      uint16_t raw = adc_single_value;
-      print_samples(&raw, 1);
-    }
-#endif
+    osDelay(1000);
   }
   /* USER CODE END 5 */
 }

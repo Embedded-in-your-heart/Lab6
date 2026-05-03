@@ -22,10 +22,6 @@
 #include "stm32l4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
-extern DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
-extern DMA_HandleTypeDef hdma_dfsdm1_flt0;
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,6 +58,7 @@ extern DMA_HandleTypeDef hdma_dfsdm1_flt0;
 extern DMA_HandleTypeDef hdma_adc1;
 extern ADC_HandleTypeDef hadc1;
 extern DMA_HandleTypeDef hdma_dfsdm1_flt0;
+extern DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
 extern TIM_HandleTypeDef htim7;
@@ -284,6 +281,20 @@ void TIM7_IRQHandler(void)
   /* USER CODE BEGIN TIM7_IRQn 1 */
 
   /* USER CODE END TIM7_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DFSDM1 filter0 global interrupt.
+  */
+void DFSDM1_FLT0_IRQHandler(void)
+{
+  /* USER CODE BEGIN DFSDM1_FLT0_IRQn 0 */
+
+  /* USER CODE END DFSDM1_FLT0_IRQn 0 */
+  HAL_DFSDM_IRQHandler(&hdfsdm1_filter0);
+  /* USER CODE BEGIN DFSDM1_FLT0_IRQn 1 */
+
+  /* USER CODE END DFSDM1_FLT0_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */
