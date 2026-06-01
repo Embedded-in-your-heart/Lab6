@@ -75,7 +75,7 @@ volatile uint8_t DmaRecHalBuffCplt=0;
 volatile uint8_t DmaRecBuffCplt=0;
 
 /* Phase C1b: ADC1 + DMA1_Ch1 as a known-good peripheral-triggered DMA reference */
-uint16_t adcBuf[8];
+volatile uint16_t adcBuf[8];
 volatile uint32_t adcCpltCnt=0;
 
 /* Phase B1: software-triggered memory-to-memory DMA test buffers (SRAM1) */
