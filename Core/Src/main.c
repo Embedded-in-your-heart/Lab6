@@ -73,6 +73,14 @@ int32_t PlayBuf[AUDIO_REC];
 
 volatile uint8_t DmaRecHalBuffCplt=0;
 volatile uint8_t DmaRecBuffCplt=0;
+
+/* Phase C1b: ADC1 + DMA1_Ch1 as a known-good peripheral-triggered DMA reference */
+uint16_t adcBuf[8];
+volatile uint32_t adcCpltCnt=0;
+
+/* Phase B1: software-triggered memory-to-memory DMA test buffers (SRAM1) */
+uint32_t m2mSrc[8];
+uint32_t m2mDst[8];
 int __io_putchar(int ch) { 
   HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);  
   return ch;
@@ -99,7 +107,80 @@ void StartDefaultTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Phase C1 diagnostics: dump DFSDM + DMA1_Channel4 state to see whether the DMA
+ * is actually moving data. On STM32L475 (RM0351 Rev 9, Table 44) the correct
+ * value is C4S = 0 (== DFSDM1_FLT0); a stuck CNDTR with ROVRF=1 means the filter
+ * produces samples but the DMA never reads FLTRDATAR. */
+static void dump_dfsdm_dma_state(const char *tag)
+{
+  uint32_t cselr = DMA1_CSELR->CSELR;
+  uint32_t c4s   = (cselr >> 12) & 0xFU;            /* DMA1 Channel4 request selection */
+  uint32_t ccr   = hdma_dfsdm1_flt0.Instance->CCR;
+  uint32_t cndtr = hdma_dfsdm1_flt0.Instance->CNDTR;
+  uint32_t cr1   = hdfsdm1_filter0.Instance->FLTCR1;
+  uint32_t isr   = hdfsdm1_filter0.Instance->FLTISR;
 
+  printf("[diag:%s]\r\n", tag);
+  printf("  DMA  CSELR=%08lX C4S=%lu (expect 0 = DFSDM1_FLT0)\r\n",
+         (unsigned long)cselr, (unsigned long)c4s);
+  printf("  DMA  CCR=%08lX EN=%lu HTIE=%lu TCIE=%lu CIRC=%lu  CNDTR=%lu\r\n",
+         (unsigned long)ccr,
+         (unsigned long)((ccr & DMA_CCR_EN)   != 0U),
+         (unsigned long)((ccr & DMA_CCR_HTIE) != 0U),
+         (unsigned long)((ccr & DMA_CCR_TCIE) != 0U),
+         (unsigned long)((ccr & DMA_CCR_CIRC) != 0U),
+         (unsigned long)cndtr);
+  printf("  FLT0 CR1=%08lX RDMAEN=%lu  ISR=%08lX REOCF=%lu ROVRF=%lu\r\n",
+         (unsigned long)cr1,
+         (unsigned long)((cr1 & DFSDM_FLTCR1_RDMAEN) != 0U),
+         (unsigned long)isr,
+         (unsigned long)((isr & DFSDM_FLTISR_REOCF) != 0U),
+         (unsigned long)((isr & DFSDM_FLTISR_ROVRF) != 0U));
+  printf("  ADC  CNDTR=%lu (DMA1_Ch1 ref) cplt=%lu\r\n",
+         (unsigned long)hdma_adc1.Instance->CNDTR, (unsigned long)adcCpltCnt);
+  printf("  SYS  DMA1_ISR=%08lX  ADC_ISR=%08lX EOC=%lu OVR=%lu\r\n",
+         (unsigned long)DMA1->ISR,
+         (unsigned long)hadc1.Instance->ISR,
+         (unsigned long)((hadc1.Instance->ISR & ADC_ISR_EOC) != 0U),
+         (unsigned long)((hadc1.Instance->ISR & ADC_ISR_OVR) != 0U));
+  printf("  ERR  dfsdmDMA_ErrorCode=0x%lX  adcDMA_ErrorCode=0x%lX  dfsdmFilterErr=0x%lX adcErr=0x%lX\r\n",
+         (unsigned long)hdma_dfsdm1_flt0.ErrorCode, (unsigned long)hdma_adc1.ErrorCode,
+         (unsigned long)hdfsdm1_filter0.ErrorCode,  (unsigned long)hadc1.ErrorCode);
+}
+
+/* Phase B1: software-triggered memory-to-memory DMA on DMA1 (unused Channel3).
+ * MEM2MEM needs NO peripheral request and NO CSELR mux — it tests whether DMA1
+ * can move data to/from SRAM at all. If poll times out / err=TE(0x1) and CNDTR
+ * stays 8, DMA1 cannot reach the buffer's memory (confirms the access theory).
+ * If it completes and dst==src, memory is fine and the fault is request routing. */
+static void test_dma1_m2m(void)
+{
+  static DMA_HandleTypeDef hdma_test;
+  HAL_StatusTypeDef st_init, st_start, st_poll;
+
+  for (uint32_t i = 0; i < 8U; i++) { m2mSrc[i] = 0xA5A50000U + i; m2mDst[i] = 0U; }
+
+  hdma_test.Instance                 = DMA1_Channel3;          /* unused channel */
+  hdma_test.Init.Request             = DMA_REQUEST_0;          /* ignored in MEM2MEM */
+  hdma_test.Init.Direction           = DMA_MEMORY_TO_MEMORY;
+  hdma_test.Init.PeriphInc           = DMA_PINC_ENABLE;
+  hdma_test.Init.MemInc              = DMA_MINC_ENABLE;
+  hdma_test.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+  hdma_test.Init.MemDataAlignment    = DMA_MDATAALIGN_WORD;
+  hdma_test.Init.Mode                = DMA_NORMAL;
+  hdma_test.Init.Priority            = DMA_PRIORITY_LOW;
+  st_init  = HAL_DMA_Init(&hdma_test);
+  /* MEM2MEM: src goes to CPAR, dst to CMAR; DMA copies src -> dst immediately */
+  st_start = HAL_DMA_Start(&hdma_test, (uint32_t)m2mSrc, (uint32_t)m2mDst, 8);
+  st_poll  = HAL_DMA_PollForTransfer(&hdma_test, HAL_DMA_FULL_TRANSFER, 100);
+
+  printf("[diag:m2m] init=%d start=%d poll=%d err=0x%lX CNDTR=%lu  dst[0]=%08lX dst[7]=%08lX (src[0]=%08lX)\r\n",
+         (int)st_init, (int)st_start, (int)st_poll, (unsigned long)hdma_test.ErrorCode,
+         (unsigned long)hdma_test.Instance->CNDTR,
+         (unsigned long)m2mDst[0], (unsigned long)m2mDst[7], (unsigned long)m2mSrc[0]);
+
+  HAL_DMA_DeInit(&hdma_test);
+}
 /* USER CODE END 0 */
 
 /**
@@ -142,7 +223,18 @@ int main(void)
   MX_TIM6_Init();
   MX_DFSDM1_Init();
   /* USER CODE BEGIN 2 */
+  /* Phase B1: does DMA1 move SRAM->SRAM at all? (no peripheral request) */
+  test_dma1_m2m();
+
+  /* Phase C1b: start the ADC reference DMA (peripheral-triggered, DMA1_Ch1) */
+  HAL_TIM_Base_Start(&htim1);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adcBuf, 8);
+
+  dump_dfsdm_dma_state("before-start");
   HAL_DFSDM_FilterRegularStart_DMA(&hdfsdm1_filter0, RecBuf, AUDIO_REC);
+  dump_dfsdm_dma_state("after-start");
+  HAL_Delay(300);
+  dump_dfsdm_dma_state("after-300ms");   /* CNDTR should have moved if DMA is alive */
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -826,7 +918,21 @@ void HAL_DFSDM_FilterErrorCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
 {
     // 在這裡打個斷點 (Breakpoint)
     // 檢查 hdfsdm_filter->ErrorCode
-    printf("DFSDM Error!\r\n"); 
+    printf("DFSDM Error!\r\n");
+}
+
+/* Phase C1b: ADC reference DMA completion — proves DMA1 peripheral-triggered path */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1) { adcCpltCnt++; }
+}
+
+/* Phase C1c: positive error confirmation — fires on ADC or its DMA error (TEIF) */
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+  printf("[diag:ADC ERROR] ErrorCode=0x%lX  DMA_ErrorCode=0x%lX\r\n",
+         (unsigned long)hadc->ErrorCode,
+         (unsigned long)(hadc->DMA_Handle ? hadc->DMA_Handle->ErrorCode : 0U));
 }
 /* USER CODE END 4 */
 
@@ -844,6 +950,7 @@ void StartDefaultTask(void *argument)
   for(;;)
   {
     printf("Default Task\r\n");
+    dump_dfsdm_dma_state("task");   /* watch CNDTR change across iterations */
     if (DmaRecHalBuffCplt)
     {
       printf("Hal PlayBuf: ");
