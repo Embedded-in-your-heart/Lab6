@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,6 +44,10 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
+DFSDM_Channel_HandleTypeDef hdfsdm1_channel2;
+DMA_HandleTypeDef hdma_dfsdm1_flt0;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim6;
@@ -57,17 +61,36 @@ const osThreadAttr_t defaultTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for micSem */
-osSemaphoreId_t micSemHandle;
-const osSemaphoreAttr_t micSem_attributes = {
-  .name = "micSem"
+/* Definitions for adcSem */
+osSemaphoreId_t adcSemHandle;
+const osSemaphoreAttr_t adcSem_attributes = {
+  .name = "adcSem"
 };
 /* USER CODE BEGIN PV */
+#define AUDIO_REC 1024
+int32_t RecBuf[AUDIO_REC];
+int32_t PlayBuf[AUDIO_REC];
+
+volatile uint8_t DmaRecHalBuffCplt=0;
+volatile uint8_t DmaRecBuffCplt=0;
+
+/* Phase C1b: ADC1 + DMA1_Ch1 as a known-good peripheral-triggered DMA reference */
+volatile uint16_t adcBuf[8];
+volatile uint32_t adcCpltCnt=0;
+
+/* Phase B1: software-triggered memory-to-memory DMA test buffers (SRAM1) */
+uint32_t m2mSrc[8];
+uint32_t m2mDst[8];
+int __io_putchar(int ch) { 
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);  
+  return ch;
+}
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
@@ -75,6 +98,7 @@ static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_DFSDM1_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -83,7 +107,80 @@ void StartDefaultTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Phase C1 diagnostics: dump DFSDM + DMA1_Channel4 state to see whether the DMA
+ * is actually moving data. On STM32L475 (RM0351 Rev 9, Table 44) the correct
+ * value is C4S = 0 (== DFSDM1_FLT0); a stuck CNDTR with ROVRF=1 means the filter
+ * produces samples but the DMA never reads FLTRDATAR. */
+static void dump_dfsdm_dma_state(const char *tag)
+{
+  uint32_t cselr = DMA1_CSELR->CSELR;
+  uint32_t c4s   = (cselr >> 12) & 0xFU;            /* DMA1 Channel4 request selection */
+  uint32_t ccr   = hdma_dfsdm1_flt0.Instance->CCR;
+  uint32_t cndtr = hdma_dfsdm1_flt0.Instance->CNDTR;
+  uint32_t cr1   = hdfsdm1_filter0.Instance->FLTCR1;
+  uint32_t isr   = hdfsdm1_filter0.Instance->FLTISR;
 
+  printf("[diag:%s]\r\n", tag);
+  printf("  DMA  CSELR=%08lX C4S=%lu (expect 0 = DFSDM1_FLT0)\r\n",
+         (unsigned long)cselr, (unsigned long)c4s);
+  printf("  DMA  CCR=%08lX EN=%lu HTIE=%lu TCIE=%lu CIRC=%lu  CNDTR=%lu\r\n",
+         (unsigned long)ccr,
+         (unsigned long)((ccr & DMA_CCR_EN)   != 0U),
+         (unsigned long)((ccr & DMA_CCR_HTIE) != 0U),
+         (unsigned long)((ccr & DMA_CCR_TCIE) != 0U),
+         (unsigned long)((ccr & DMA_CCR_CIRC) != 0U),
+         (unsigned long)cndtr);
+  printf("  FLT0 CR1=%08lX RDMAEN=%lu  ISR=%08lX REOCF=%lu ROVRF=%lu\r\n",
+         (unsigned long)cr1,
+         (unsigned long)((cr1 & DFSDM_FLTCR1_RDMAEN) != 0U),
+         (unsigned long)isr,
+         (unsigned long)((isr & DFSDM_FLTISR_REOCF) != 0U),
+         (unsigned long)((isr & DFSDM_FLTISR_ROVRF) != 0U));
+  printf("  ADC  CNDTR=%lu (DMA1_Ch1 ref) cplt=%lu\r\n",
+         (unsigned long)hdma_adc1.Instance->CNDTR, (unsigned long)adcCpltCnt);
+  printf("  SYS  DMA1_ISR=%08lX  ADC_ISR=%08lX EOC=%lu OVR=%lu\r\n",
+         (unsigned long)DMA1->ISR,
+         (unsigned long)hadc1.Instance->ISR,
+         (unsigned long)((hadc1.Instance->ISR & ADC_ISR_EOC) != 0U),
+         (unsigned long)((hadc1.Instance->ISR & ADC_ISR_OVR) != 0U));
+  printf("  ERR  dfsdmDMA_ErrorCode=0x%lX  adcDMA_ErrorCode=0x%lX  dfsdmFilterErr=0x%lX adcErr=0x%lX\r\n",
+         (unsigned long)hdma_dfsdm1_flt0.ErrorCode, (unsigned long)hdma_adc1.ErrorCode,
+         (unsigned long)hdfsdm1_filter0.ErrorCode,  (unsigned long)hadc1.ErrorCode);
+}
+
+/* Phase B1: software-triggered memory-to-memory DMA on DMA1 (unused Channel3).
+ * MEM2MEM needs NO peripheral request and NO CSELR mux — it tests whether DMA1
+ * can move data to/from SRAM at all. If poll times out / err=TE(0x1) and CNDTR
+ * stays 8, DMA1 cannot reach the buffer's memory (confirms the access theory).
+ * If it completes and dst==src, memory is fine and the fault is request routing. */
+static void test_dma1_m2m(void)
+{
+  static DMA_HandleTypeDef hdma_test;
+  HAL_StatusTypeDef st_init, st_start, st_poll;
+
+  for (uint32_t i = 0; i < 8U; i++) { m2mSrc[i] = 0xA5A50000U + i; m2mDst[i] = 0U; }
+
+  hdma_test.Instance                 = DMA1_Channel3;          /* unused channel */
+  hdma_test.Init.Request             = DMA_REQUEST_0;          /* ignored in MEM2MEM */
+  hdma_test.Init.Direction           = DMA_MEMORY_TO_MEMORY;
+  hdma_test.Init.PeriphInc           = DMA_PINC_ENABLE;
+  hdma_test.Init.MemInc              = DMA_MINC_ENABLE;
+  hdma_test.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+  hdma_test.Init.MemDataAlignment    = DMA_MDATAALIGN_WORD;
+  hdma_test.Init.Mode                = DMA_NORMAL;
+  hdma_test.Init.Priority            = DMA_PRIORITY_LOW;
+  st_init  = HAL_DMA_Init(&hdma_test);
+  /* MEM2MEM: src goes to CPAR, dst to CMAR; DMA copies src -> dst immediately */
+  st_start = HAL_DMA_Start(&hdma_test, (uint32_t)m2mSrc, (uint32_t)m2mDst, 8);
+  st_poll  = HAL_DMA_PollForTransfer(&hdma_test, HAL_DMA_FULL_TRANSFER, 100);
+
+  printf("[diag:m2m] init=%d start=%d poll=%d err=0x%lX CNDTR=%lu  dst[0]=%08lX dst[7]=%08lX (src[0]=%08lX)\r\n",
+         (int)st_init, (int)st_start, (int)st_poll, (unsigned long)hdma_test.ErrorCode,
+         (unsigned long)hdma_test.Instance->CNDTR,
+         (unsigned long)m2mDst[0], (unsigned long)m2mDst[7], (unsigned long)m2mSrc[0]);
+
+  HAL_DMA_DeInit(&hdma_test);
+}
 /* USER CODE END 0 */
 
 /**
@@ -109,6 +206,9 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
+  /* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -121,8 +221,20 @@ int main(void)
   MX_TIM2_Init();
   MX_USART1_UART_Init();
   MX_TIM6_Init();
+  MX_DFSDM1_Init();
   /* USER CODE BEGIN 2 */
+  /* Phase B1: does DMA1 move SRAM->SRAM at all? (no peripheral request) */
+  test_dma1_m2m();
 
+  /* Phase C1b: start the ADC reference DMA (peripheral-triggered, DMA1_Ch1) */
+  HAL_TIM_Base_Start(&htim1);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adcBuf, 8);
+
+  dump_dfsdm_dma_state("before-start");
+  HAL_DFSDM_FilterRegularStart_DMA(&hdfsdm1_filter0, RecBuf, AUDIO_REC);
+  dump_dfsdm_dma_state("after-start");
+  HAL_Delay(300);
+  dump_dfsdm_dma_state("after-300ms");   /* CNDTR should have moved if DMA is alive */
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -133,8 +245,8 @@ int main(void)
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
-  /* creation of micSem */
-  micSemHandle = osSemaphoreNew(1, 0, &micSem_attributes);
+  /* creation of adcSem */
+  adcSemHandle = osSemaphoreNew(1, 0, &adcSem_attributes);
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
@@ -237,6 +349,32 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the peripherals clock
+  */
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_SAI1|RCC_PERIPHCLK_ADC;
+  PeriphClkInit.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLLSAI1;
+  PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
+  PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_MSI;
+  PeriphClkInit.PLLSAI1.PLLSAI1M = 1;
+  PeriphClkInit.PLLSAI1.PLLSAI1N = 24;
+  PeriphClkInit.PLLSAI1.PLLSAI1P = RCC_PLLP_DIV7;
+  PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
+  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_SAI1CLK|RCC_PLLSAI1_ADC1CLK;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief ADC1 Initialization Function
   * @param None
   * @retval None
@@ -300,6 +438,68 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief DFSDM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DFSDM1_Init(void)
+{
+
+  /* USER CODE BEGIN DFSDM1_Init 0 */
+
+  /* USER CODE END DFSDM1_Init 0 */
+
+  /* USER CODE BEGIN DFSDM1_Init 1 */
+
+  /* USER CODE END DFSDM1_Init 1 */
+  hdfsdm1_filter0.Instance = DFSDM1_Filter0;
+  hdfsdm1_filter0.Init.RegularParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
+  hdfsdm1_filter0.Init.RegularParam.FastMode = DISABLE;
+  hdfsdm1_filter0.Init.RegularParam.DmaMode = ENABLE;
+  hdfsdm1_filter0.Init.InjectedParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
+  hdfsdm1_filter0.Init.InjectedParam.ScanMode = DISABLE;
+  hdfsdm1_filter0.Init.InjectedParam.DmaMode = DISABLE;
+  hdfsdm1_filter0.Init.InjectedParam.ExtTrigger = DFSDM_FILTER_EXT_TRIG_TIM1_TRGO;
+  hdfsdm1_filter0.Init.InjectedParam.ExtTriggerEdge = DFSDM_FILTER_EXT_TRIG_RISING_EDGE;
+  hdfsdm1_filter0.Init.FilterParam.SincOrder = DFSDM_FILTER_SINC3_ORDER;
+  hdfsdm1_filter0.Init.FilterParam.Oversampling = 250;
+  hdfsdm1_filter0.Init.FilterParam.IntOversampling = 1;
+  if (HAL_DFSDM_FilterInit(&hdfsdm1_filter0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  hdfsdm1_channel2.Instance = DFSDM1_Channel2;
+  hdfsdm1_channel2.Init.OutputClock.Activation = ENABLE;
+  hdfsdm1_channel2.Init.OutputClock.Selection = DFSDM_CHANNEL_OUTPUT_CLOCK_AUDIO;
+  hdfsdm1_channel2.Init.OutputClock.Divider = 40;
+  hdfsdm1_channel2.Init.Input.Multiplexer = DFSDM_CHANNEL_EXTERNAL_INPUTS;
+  hdfsdm1_channel2.Init.Input.DataPacking = DFSDM_CHANNEL_STANDARD_MODE;
+  hdfsdm1_channel2.Init.Input.Pins = DFSDM_CHANNEL_SAME_CHANNEL_PINS;
+  hdfsdm1_channel2.Init.SerialInterface.Type = DFSDM_CHANNEL_SPI_RISING;
+  hdfsdm1_channel2.Init.SerialInterface.SpiClock = DFSDM_CHANNEL_SPI_CLOCK_INTERNAL;
+  hdfsdm1_channel2.Init.Awd.FilterOrder = DFSDM_CHANNEL_FASTSINC_ORDER;
+  hdfsdm1_channel2.Init.Awd.Oversampling = 1;
+  hdfsdm1_channel2.Init.Offset = 0;
+  hdfsdm1_channel2.Init.RightBitShift = 0x00;
+  if (HAL_DFSDM_ChannelInit(&hdfsdm1_channel2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DFSDM_FilterConfigRegChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_2, DFSDM_CONTINUOUS_CONV_ON) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DFSDM_FilterConfigInjChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DFSDM1_Init 2 */
+
+  /* USER CODE END DFSDM1_Init 2 */
 
 }
 
@@ -482,8 +682,8 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
   /* DMA1_Channel4_IRQn interrupt configuration */
-  NVIC_SetPriority(DMA1_Channel4_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
-  NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
 
 }
 
@@ -588,14 +788,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : DFSDM1_DATIN2_Pin DFSDM1_CKOUT_Pin */
-  GPIO_InitStruct.Pin = DFSDM1_DATIN2_Pin|DFSDM1_CKOUT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF6_DFSDM1;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pins : QUADSPI_CLK_Pin QUADSPI_NCS_Pin OQUADSPI_BK1_IO0_Pin QUADSPI_BK1_IO1_Pin
                            QUAD_SPI_BK1_IO2_Pin QUAD_SPI_BK1_IO3_Pin */
@@ -710,7 +902,38 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_DFSDM_FilterRegConvHalfCpltCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
+{
+  printf("RegConvHalfCpltCallback\r\n");
+  DmaRecHalBuffCplt=1;
+}
 
+void HAL_DFSDM_FilterRegConvCpltCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
+{
+  printf("RegConvCpltCallback\r\n");
+  DmaRecHalBuffCplt=1;
+}
+
+void HAL_DFSDM_FilterErrorCallback(DFSDM_Filter_HandleTypeDef *hdfsdm_filter)
+{
+    // 在這裡打個斷點 (Breakpoint)
+    // 檢查 hdfsdm_filter->ErrorCode
+    printf("DFSDM Error!\r\n");
+}
+
+/* Phase C1b: ADC reference DMA completion — proves DMA1 peripheral-triggered path */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1) { adcCpltCnt++; }
+}
+
+/* Phase C1c: positive error confirmation — fires on ADC or its DMA error (TEIF) */
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+  printf("[diag:ADC ERROR] ErrorCode=0x%lX  DMA_ErrorCode=0x%lX\r\n",
+         (unsigned long)hadc->ErrorCode,
+         (unsigned long)(hadc->DMA_Handle ? hadc->DMA_Handle->ErrorCode : 0U));
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -726,7 +949,30 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    printf("Default Task\r\n");
+    dump_dfsdm_dma_state("task");   /* watch CNDTR change across iterations */
+    if (DmaRecHalBuffCplt)
+    {
+      printf("Hal PlayBuf: ");
+      for(int i=0;i<AUDIO_REC;i++) {
+        PlayBuf[i]=RecBuf[i]>>8;
+        printf("%ld ",PlayBuf[i]);
+      }
+      printf("\r\n");
+      //HAL_DFSDM_FilterRegularStart_DMA(&hdfsdm1_filter0, RecBuf, AUDIO_REC);
+      DmaRecHalBuffCplt=0;
+    }
+    if (DmaRecBuffCplt)
+    {
+      printf("PlayBuf: ");
+      for(int i=0;i<AUDIO_REC;i++) {
+        PlayBuf[i]=RecBuf[i]>>8;
+        printf("%ld ",PlayBuf[i]);
+      }
+      printf("\r\n");
+      DmaRecBuffCplt=0;
+    }
+    osDelay(1000);
   }
   /* USER CODE END 5 */
 }

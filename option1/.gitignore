@@ -1,0 +1,8 @@
+build
+mx.scratch
+!.settings
+.vscode/
+.clangd
+.claude/
+CLAUDE.md
+*.pdf

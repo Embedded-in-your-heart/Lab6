@@ -73,8 +73,6 @@ void Error_Handler(void);
 #define ARD_A5_GPIO_Port GPIOC
 #define ARD_A4_Pin GPIO_PIN_1
 #define ARD_A4_GPIO_Port GPIOC
-#define ARD_A3_Pin GPIO_PIN_2
-#define ARD_A3_GPIO_Port GPIOC
 #define ARD_A2_Pin GPIO_PIN_3
 #define ARD_A2_GPIO_Port GPIOC
 #define ARD_D1_Pin GPIO_PIN_0
