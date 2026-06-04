@@ -61,6 +61,7 @@ extern DMA_HandleTypeDef hdma_dfsdm1_flt0;
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_adc1;
 extern ADC_HandleTypeDef hadc1;
+extern DMA_HandleTypeDef hdma_dfsdm1_flt0;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
 extern TIM_HandleTypeDef htim7;
@@ -182,7 +183,7 @@ void DMA1_Channel1_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles DMA1 channel 4 interrupt.
+  * @brief This function handles DMA1 channel4 global interrupt.
   */
 void DMA1_Channel4_IRQHandler(void)
 {
@@ -193,20 +194,6 @@ void DMA1_Channel4_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Channel4_IRQn 1 */
 
   /* USER CODE END DMA1_Channel4_IRQn 1 */
-}
-
-/**
-  * @brief This function handles DFSDM1_FLT0 global interrupt.
-  */
-void DFSDM1_FLT0_IRQHandler(void)
-{
-  /* USER CODE BEGIN DFSDM1_FLT0_IRQn 0 */
-
-  /* USER CODE END DFSDM1_FLT0_IRQn 0 */
-  HAL_DFSDM_IRQHandler(&hdfsdm1_filter0);
-  /* USER CODE BEGIN DFSDM1_FLT0_IRQn 1 */
-
-  /* USER CODE END DFSDM1_FLT0_IRQn 1 */
 }
 
 /**
